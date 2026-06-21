@@ -197,7 +197,26 @@ func send(botAPI *tgbotapi.BotAPI, chatID int64, text string, replyTo int) {
 	botAPI.Send(msg)
 }
 
-// parseFromText: مستقیم توی متن دنبال @ یا آیدی عددی میگرده — مشکل RTL/LTR نداره
+// isWordPresent: بررسی میکنه اسم به عنوان کلمه مستقل در متن هست
+// جلوگیری از مچ ناخواسته مثل "اسی" در "اسیاب"
+func isWordPresent(text, name string) bool {
+	words := strings.Fields(text)
+	for _, w := range words {
+		// حذف علائم نگارشی از ابتدا و انتها
+		w = strings.Trim(w, "!?.،؟؛:\"'()-_…")
+		// مچ دقیق
+		if w == name {
+			return true
+		}
+		// مچ با پسوندهای رایج فارسی که به کلمه چسبیده میشن
+		for _, suffix := range []string{"ی", "و", "رو", "را", "ام", "ات", "اش"} {
+			if w == name+suffix {
+				return true
+			}
+		}
+	}
+	return false
+}
 func parseFromText(afterCmd string) (name, identifier string) {
 	if idx := strings.Index(afterCmd, "@"); idx >= 0 {
 		end := idx + 1
@@ -480,7 +499,7 @@ func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	var mentions []string
 
 	for _, m := range members {
-		if !strings.Contains(text, m.Name) {
+		if !isWordPresent(text, m.Name) {
 			continue
 		}
 		if m.UserID.Valid {
