@@ -18,7 +18,7 @@ var db *sql.DB
 
 type Member struct {
 	Name     string
-	UserID   sql.NullInt64 // NULL = هنوز آیدی عددی نداریم، فقط @username
+	UserID   sql.NullInt64
 	Username string
 }
 
@@ -38,20 +38,15 @@ func initDB() error {
 			id         SERIAL PRIMARY KEY,
 			group_id   BIGINT       NOT NULL,
 			name       VARCHAR(100) NOT NULL,
-			user_id    BIGINT,                   -- NULL = فقط username داریم، هنوز resolve نشده
+			user_id    BIGINT,
 			username   VARCHAR(100),
 			added_by   BIGINT,
 			created_at TIMESTAMP DEFAULT NOW()
 		);
-
-		-- ایندکس برای رکوردهای resolve‌شده (آیدی عددی دارن)
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_members_resolved
 			ON members(group_id, name, user_id) WHERE user_id IS NOT NULL;
-
-		-- ایندکس برای رکوردهای هنوز resolve‌نشده (فقط username)
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_members_unresolved
 			ON members(group_id, name, username) WHERE user_id IS NULL;
-
 		CREATE TABLE IF NOT EXISTS group_settings (
 			group_id             BIGINT PRIMARY KEY,
 			allow_admin_register BOOLEAN NOT NULL DEFAULT FALSE,
@@ -63,9 +58,9 @@ func initDB() error {
 
 func getMembers(groupID int64) ([]Member, error) {
 	rows, err := db.Query(
-		`SELECT name, user_id, COALESCE(username, '')
-		 FROM members WHERE group_id = $1
-		 ORDER BY COALESCE(user_id, 0), id`,
+		`SELECT name, user_id, COALESCE(username,'')
+		 FROM members WHERE group_id=$1
+		 ORDER BY COALESCE(user_id,0), id`,
 		groupID,
 	)
 	if err != nil {
@@ -83,64 +78,53 @@ func getMembers(groupID int64) ([]Member, error) {
 	return list, nil
 }
 
-// addMemberWithID: ثبت با آیدی عددی (reply یا مستقیم)
 func addMemberWithID(groupID, userID, addedBy int64, name, username string) error {
-	// اگه رکورد @username-only برای همین نام وجود داشت، اول حذفش کن
 	db.Exec(`DELETE FROM members WHERE group_id=$1 AND name=$2 AND user_id IS NULL`, groupID, name)
-
 	_, err := db.Exec(`
 		INSERT INTO members (group_id, name, user_id, username, added_by)
-		VALUES ($1, $2, $3, $4, $5)
+		VALUES ($1,$2,$3,$4,$5)
 		ON CONFLICT (group_id, name, user_id) WHERE user_id IS NOT NULL
-		DO UPDATE SET username = EXCLUDED.username
+		DO UPDATE SET username=EXCLUDED.username
 	`, groupID, name, userID, nullStr(username), addedBy)
 	return err
 }
 
-// addMemberUsernameOnly: ثبت فقط با @username (آیدی عددی نداریم هنوز)
 func addMemberUsernameOnly(groupID, addedBy int64, name, username string) error {
 	_, err := db.Exec(`
 		INSERT INTO members (group_id, name, user_id, username, added_by)
-		VALUES ($1, $2, NULL, $3, $4)
+		VALUES ($1,$2,NULL,$3,$4)
 		ON CONFLICT (group_id, name, username) WHERE user_id IS NULL
-		DO UPDATE SET username = EXCLUDED.username
+		DO UPDATE SET username=EXCLUDED.username
 	`, groupID, name, username, addedBy)
 	return err
 }
 
-// autoResolve: وقتی کسی پیام میده و @username مچ خورد، آیدی عددیشو ذخیره میکنه
 func autoResolve(groupID int64, username string, realUserID int64) {
 	if username == "" {
 		return
 	}
-
-	// اگه با همین user_id و username قبلاً رکورد وجود داشت، رکورد NULL رو حذف کن
 	db.Exec(`
 		DELETE FROM members
-		WHERE group_id = $1 AND username = $2 AND user_id IS NULL
+		WHERE group_id=$1 AND username=$2 AND user_id IS NULL
 		AND EXISTS (
 			SELECT 1 FROM members m2
-			WHERE m2.group_id = $1 AND m2.name = members.name AND m2.user_id = $3
+			WHERE m2.group_id=$1 AND m2.name=members.name AND m2.user_id=$3
 		)
 	`, groupID, username, realUserID)
-
-	// بقیه رکوردهای NULL رو با آیدی واقعی آپدیت کن
 	result, err := db.Exec(`
-		UPDATE members SET user_id = $1
-		WHERE group_id = $2 AND username = $3 AND user_id IS NULL
+		UPDATE members SET user_id=$1
+		WHERE group_id=$2 AND username=$3 AND user_id IS NULL
 	`, realUserID, groupID, username)
-
 	if err == nil {
 		if n, _ := result.RowsAffected(); n > 0 {
-			log.Printf("✅ auto-resolved @%s → user_id %d (group %d)", username, realUserID, groupID)
+			log.Printf("✅ auto-resolved @%s → %d (group %d)", username, realUserID, groupID)
 		}
 	}
 }
 
 func getUserIDsByName(groupID int64, name string) ([]sql.NullInt64, error) {
 	rows, err := db.Query(
-		`SELECT DISTINCT user_id FROM members WHERE group_id = $1 AND name = $2`,
-		groupID, name,
+		`SELECT DISTINCT user_id FROM members WHERE group_id=$1 AND name=$2`, groupID, name,
 	)
 	if err != nil {
 		return nil, err
@@ -157,7 +141,7 @@ func getUserIDsByName(groupID int64, name string) ([]sql.NullInt64, error) {
 }
 
 func deleteMember(groupID int64, name string) (bool, error) {
-	res, err := db.Exec(`DELETE FROM members WHERE group_id = $1 AND name = $2`, groupID, name)
+	res, err := db.Exec(`DELETE FROM members WHERE group_id=$1 AND name=$2`, groupID, name)
 	if err != nil {
 		return false, err
 	}
@@ -165,10 +149,15 @@ func deleteMember(groupID int64, name string) (bool, error) {
 	return n > 0, nil
 }
 
+func deleteAllMembers(groupID int64) error {
+	_, err := db.Exec(`DELETE FROM members WHERE group_id=$1`, groupID)
+	return err
+}
+
 func getAllowAdmin(groupID int64) bool {
 	var allow bool
 	err := db.QueryRow(
-		`SELECT allow_admin_register FROM group_settings WHERE group_id = $1`, groupID,
+		`SELECT allow_admin_register FROM group_settings WHERE group_id=$1`, groupID,
 	).Scan(&allow)
 	return err == nil && allow
 }
@@ -176,9 +165,9 @@ func getAllowAdmin(groupID int64) bool {
 func setAllowAdmin(groupID int64, allow bool) error {
 	_, err := db.Exec(`
 		INSERT INTO group_settings (group_id, allow_admin_register)
-		VALUES ($1, $2)
+		VALUES ($1,$2)
 		ON CONFLICT (group_id)
-		DO UPDATE SET allow_admin_register = EXCLUDED.allow_admin_register, updated_at = NOW()
+		DO UPDATE SET allow_admin_register=EXCLUDED.allow_admin_register, updated_at=NOW()
 	`, groupID, allow)
 	return err
 }
@@ -209,14 +198,12 @@ func canRegister(botAPI *tgbotapi.BotAPI, chatID int64, userID int) bool {
 	return isOwner(botAPI, chatID, userID)
 }
 
-// mentionByID: تگ با آیدی عددی — همیشه کار میکنه
 func mentionByID(name string, userID int64) string {
 	return fmt.Sprintf(`<a href="tg://user?id=%d">%s</a>`, userID, name)
 }
 
-// mentionByUsername: تگ با @username — اگه عوض کنه کار نمیکنه
 func mentionByUsername(name, username string) string {
-	return fmt.Sprintf(`<a href="https://t.me/%s">%s</a> ⚠️`, username, name)
+	return fmt.Sprintf(`<a href="https://t.me/%s">%s</a>`, username, name)
 }
 
 func buildMention(m Member) string {
@@ -235,6 +222,22 @@ func send(botAPI *tgbotapi.BotAPI, chatID int64, text string, replyTo int) {
 	botAPI.Send(msg)
 }
 
+// parseIdentifier: بدون در نظر گرفتن ترتیب RTL/LTR، شناسه و اسم رو جدا میکنه
+func parseNameAndID(parts []string) (name, identifier string) {
+	var nameParts []string
+	for _, p := range parts {
+		hasAt := strings.Contains(p, "@")
+		_, numErr := strconv.ParseInt(strings.Trim(p, "@"), 10, 64)
+		if (hasAt || numErr == nil) && identifier == "" {
+			identifier = p
+		} else {
+			nameParts = append(nameParts, p)
+		}
+	}
+	name = strings.Join(nameParts, " ")
+	return
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 func handleRegister(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
@@ -245,10 +248,9 @@ func handleRegister(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	text := strings.TrimSpace(msg.Text)
-	afterCmd := strings.TrimSpace(strings.TrimPrefix(text, "ثبت"))
+	afterCmd := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(msg.Text), "ثبت"))
 
-	// ── روش ۱: reply (بهترین — آیدی عددی + username)
+	// ── روش ۱: reply (بهترین روش)
 	if msg.ReplyToMessage != nil {
 		name := afterCmd
 		if name == "" {
@@ -266,57 +268,61 @@ func handleRegister(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			return
 		}
 		send(botAPI, chatID,
-			fmt.Sprintf("✅ %s با اسم <b>%s</b> ثبت شد!\n🔒 آیدی عددی ذخیره شد.",
+			fmt.Sprintf("✅ %s با اسم <b>%s</b> ثبت شد! 🔒",
 				mentionByID(name, int64(target.ID)), name), msgID)
 		return
 	}
 
 	// ── روش ۲ و ۳: بدون reply
-	// فرمت: ثبت فرهاد 123456789   یا   ثبت فرهاد @farhad
 	parts := strings.Fields(afterCmd)
 	if len(parts) < 2 {
 		send(botAPI, chatID,
 			"❌ سه روش ثبت:\n\n"+
 				"۱. <b>reply</b> روی پیام + <code>ثبت فرهاد</code> ✅ بهترین\n"+
-				"۲. <code>ثبت فرهاد 123456789</code> (آیدی عددی)\n"+
-				"۳. <code>ثبت فرهاد @farhad</code> (تا دفعه بعد که پیام بده آیدیش ذخیره میشه)", msgID)
+				"۲. <code>ثبت فرهاد 123456789</code> آیدی عددی\n"+
+				"۳. <code>ثبت فرهاد @farhad</code> یوزرنیم", msgID)
 		return
 	}
 
-	name := parts[0]
-	identifier := parts[1]
+	// جدا کردن اسم و شناسه بدون توجه به ترتیب RTL/LTR
+	name, identifier := parseNameAndID(parts)
 
-	if strings.HasPrefix(identifier, "@") {
-		// روش ۳: فقط @username — موقتاً بدون آیدی عددی
-		username := strings.TrimPrefix(identifier, "@")
+	if name == "" || identifier == "" {
+		send(botAPI, chatID, "❌ اسم و شناسه رو هر دو بنویس.", msgID)
+		return
+	}
+
+	if strings.Contains(identifier, "@") {
+		// روش ۳: @username
+		username := strings.Trim(identifier, "@")
 		if err := addMemberUsernameOnly(chatID, int64(msg.From.ID), name, username); err != nil {
 			log.Println("addMemberUsernameOnly:", err)
 			send(botAPI, chatID, "❌ خطا در ثبت.", msgID)
 			return
 		}
 		send(botAPI, chatID,
-			fmt.Sprintf("✅ <b>%s</b> (@%s) ثبت شد!\n⏳ آیدی عددیش دفعه‌ای که توی گروه پیام بده خودکار ذخیره میشه.",
+			fmt.Sprintf("✅ <b>%s</b> (@%s) ثبت شد!\n⏳ آیدی عددی دفعه‌ای که پیام بده خودکار ذخیره میشه.",
 				name, username), msgID)
 		return
 	}
 
-	// روش ۲: آیدی عددی مستقیم
-	userID, err := strconv.ParseInt(identifier, 10, 64)
+	// روش ۲: آیدی عددی
+	userID, err := strconv.ParseInt(strings.Trim(identifier, "@"), 10, 64)
 	if err != nil || userID <= 0 {
-		send(botAPI, chatID,
-			"❌ آیدی عددی معتبر نیست!\nمثال: <code>ثبت فرهاد 123456789</code>", msgID)
+		send(botAPI, chatID, "❌ شناسه معتبر نیست!\nمثال: <code>ثبت فرهاد 123456789</code>", msgID)
 		return
 	}
 	if err := addMemberWithID(chatID, userID, int64(msg.From.ID), name, ""); err != nil {
-		log.Println("addMemberWithID numeric:", err)
+		log.Println("addMemberWithID:", err)
 		send(botAPI, chatID, "❌ خطا در ثبت.", msgID)
 		return
 	}
 	send(botAPI, chatID,
-		fmt.Sprintf("✅ %s با اسم <b>%s</b> ثبت شد!\n🔒 آیدی عددی ذخیره شد.",
+		fmt.Sprintf("✅ %s با اسم <b>%s</b> ثبت شد! 🔒",
 			mentionByID(name, userID), name), msgID)
 }
 
+// handleAlias: لقب‌جدید را به همان user_id اسم‌اصلی متصل میکند
 func handleAlias(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	msgID := msg.MessageID
@@ -325,43 +331,42 @@ func handleAlias(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	parts := strings.Fields(msg.Text)
-	if len(parts) != 3 {
+	// فرمت: لقب فری فرهاد
+	afterCmd := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(msg.Text), "لقب"))
+	parts := strings.Fields(afterCmd)
+	if len(parts) != 2 {
 		send(botAPI, chatID,
-			"❌ فرمت: <code>لقب فری فرهاد</code>\n(اول لقب جدید، بعد اسم اصلی که قبلاً ثبت شده)", msgID)
+			"❌ فرمت: <code>لقب فری فرهاد</code>\n(لقب جدید + اسم اصلی که قبلاً ثبت شده)", msgID)
 		return
 	}
-	aliasName := parts[1]
-	mainName := parts[2]
+	aliasName := parts[0]
+	mainName := parts[1]
 
 	ids, err := getUserIDsByName(chatID, mainName)
 	if err != nil || len(ids) == 0 {
-		send(botAPI, chatID, fmt.Sprintf("❌ «%s» در لیست پیدا نشد.", mainName), msgID)
+		send(botAPI, chatID, fmt.Sprintf("❌ «%s» در لیست پیدا نشد. اول ثبتش کن.", mainName), msgID)
 		return
 	}
 
-	// فقط رکوردهای resolve‌شده (آیدی عددی دارن) رو در نظر بگیر
 	var resolvedIDs []int64
 	for _, id := range ids {
 		if id.Valid {
 			resolvedIDs = append(resolvedIDs, id.Int64)
 		}
 	}
-
 	if len(resolvedIDs) == 0 {
 		send(botAPI, chatID,
-			fmt.Sprintf("❌ «%s» هنوز آیدی عددی نداره. صبر کن یه پیام توی گروه بده تا ثبت بشه.", mainName), msgID)
+			fmt.Sprintf("❌ «%s» هنوز آیدی عددی نداره.\nصبر کن یه پیام توی گروه بده.", mainName), msgID)
 		return
 	}
 	if len(resolvedIDs) > 1 {
-		send(botAPI, chatID,
-			fmt.Sprintf("❌ چند نفر با اسم «%s» وجود دارن.", mainName), msgID)
+		send(botAPI, chatID, fmt.Sprintf("❌ چند نفر با اسم «%s» هستن.", mainName), msgID)
 		return
 	}
 
 	var username string
 	db.QueryRow(
-		`SELECT COALESCE(username, '') FROM members WHERE group_id=$1 AND user_id=$2 LIMIT 1`,
+		`SELECT COALESCE(username,'') FROM members WHERE group_id=$1 AND user_id=$2 LIMIT 1`,
 		chatID, resolvedIDs[0],
 	).Scan(&username)
 
@@ -382,21 +387,38 @@ func handleRemove(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(msg.Text), "حذف"))
-	if name == "" {
-		send(botAPI, chatID, "❌ اسم رو بنویس!\nمثال: <code>حذف فرهاد</code>", msgID)
+	afterCmd := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(msg.Text), "حذف"))
+
+	// حذف کل — فقط مالک
+	if afterCmd == "کل" {
+		if !isOwner(botAPI, chatID, msg.From.ID) {
+			send(botAPI, chatID, "❌ فقط مالک گروه میتونه همه لیست رو پاک کنه.", msgID)
+			return
+		}
+		if err := deleteAllMembers(chatID); err != nil {
+			send(botAPI, chatID, "❌ خطا در حذف.", 0)
+			return
+		}
+		send(botAPI, chatID, "✅ همه اسم‌ها از لیست حذف شدند.", 0)
 		return
 	}
-	found, err := deleteMember(chatID, name)
+
+	if afterCmd == "" {
+		send(botAPI, chatID,
+			"❌ اسم رو بنویس!\n<code>حذف فرهاد</code> ← یه اسم\n<code>حذف کل</code> ← همه اسم‌ها (فقط مالک)", msgID)
+		return
+	}
+
+	found, err := deleteMember(chatID, afterCmd)
 	if err != nil {
 		send(botAPI, chatID, "❌ خطا در حذف.", 0)
 		return
 	}
 	if !found {
-		send(botAPI, chatID, fmt.Sprintf("❌ «%s» در لیست پیدا نشد.", name), msgID)
+		send(botAPI, chatID, fmt.Sprintf("❌ «%s» در لیست پیدا نشد.", afterCmd), msgID)
 		return
 	}
-	send(botAPI, chatID, fmt.Sprintf("✅ «%s» از لیست حذف شد.", name), 0)
+	send(botAPI, chatID, fmt.Sprintf("✅ «%s» از لیست حذف شد.", afterCmd), 0)
 }
 
 func handleList(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
@@ -407,15 +429,13 @@ func handleList(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	type PersonInfo struct {
-		Names    []string
-		MainRef  Member
-	}
-
-	// کلید گروه‌بندی: آیدی عددی (اگه داشت) یا username
 	type Key struct {
 		UserID   int64
 		Username string
+	}
+	type PersonInfo struct {
+		Names   []string
+		MainRef Member
 	}
 	personMap := make(map[Key]*PersonInfo)
 	var order []Key
@@ -440,6 +460,9 @@ func handleList(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		m := p.MainRef
 		m.Name = p.Names[0]
 		tag := buildMention(m)
+		if !m.UserID.Valid {
+			tag += " ⏳"
+		}
 		line := fmt.Sprintf("%d. %s", i+1, tag)
 		if len(p.Names) > 1 {
 			line += fmt.Sprintf("\n    └ لقب‌ها: %s", strings.Join(p.Names[1:], "، "))
@@ -472,41 +495,32 @@ func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	if text == "" {
 		return
 	}
-
 	members, err := getMembers(chatID)
 	if err != nil || len(members) == 0 {
 		return
 	}
 
-	// name → []Member
-	type MatchGroup struct {
-		Members []Member
-	}
+	type MatchGroup struct{ Members []Member }
 	nameMatches := make(map[string]*MatchGroup)
-
 	for _, m := range members {
 		if !strings.Contains(text, m.Name) {
 			continue
 		}
-		if _, exists := nameMatches[m.Name]; !exists {
+		if _, ok := nameMatches[m.Name]; !ok {
 			nameMatches[m.Name] = &MatchGroup{}
 		}
 		nameMatches[m.Name].Members = append(nameMatches[m.Name].Members, m)
 	}
-
 	if len(nameMatches) == 0 {
 		return
 	}
 
-	// آیدی فرستنده رو نادیده بگیر
 	senderID := int64(msg.From.ID)
 	taggedIDs := map[int64]bool{senderID: true}
 	taggedUsernames := map[string]bool{}
-
 	var normalMentions []string
 
 	for name, group := range nameMatches {
-		// حذف خود فرستنده از لیست
 		var filtered []Member
 		for _, m := range group.Members {
 			if m.UserID.Valid && m.UserID.Int64 == senderID {
@@ -532,7 +546,6 @@ func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				}
 			}
 		} else {
-			// اسم مشترک — پیام مبهم
 			var tags []string
 			for _, m := range filtered {
 				if m.UserID.Valid {
@@ -610,7 +623,6 @@ func main() {
 			continue
 		}
 
-		// ── Auto-resolve: هر پیامی که از کسی با @username میاد، آیدی عددیشو ذخیره میکنیم
 		if msg.From.UserName != "" {
 			go autoResolve(msg.Chat.ID, msg.From.UserName, int64(msg.From.ID))
 		}
@@ -620,7 +632,7 @@ func main() {
 		switch {
 		case text == "ثبت" || strings.HasPrefix(text, "ثبت "):
 			handleRegister(botAPI, msg)
-		case strings.HasPrefix(text, "لقب "):
+		case text == "لقب" || strings.HasPrefix(text, "لقب "):
 			handleAlias(botAPI, msg)
 		case text == "حذف" || strings.HasPrefix(text, "حذف "):
 			handleRemove(botAPI, msg)
