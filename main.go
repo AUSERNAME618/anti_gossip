@@ -222,13 +222,33 @@ func send(botAPI *tgbotapi.BotAPI, chatID int64, text string, replyTo int) {
 	botAPI.Send(msg)
 }
 
-// parseIdentifier: بدون در نظر گرفتن ترتیب RTL/LTR، شناسه و اسم رو جدا میکنه
-func parseNameAndID(parts []string) (name, identifier string) {
+// parseFromText: مستقیم توی متن دنبال @ یا آیدی عددی میگرده — مشکل RTL/LTR نداره
+func parseFromText(afterCmd string) (name, identifier string) {
+	// اگه @ توی متن بود، username رو استخراج کن
+	if idx := strings.Index(afterCmd, "@"); idx >= 0 {
+		// پیدا کردن ادامه username تا اولین فاصله
+		end := idx + 1
+		for end < len(afterCmd) && afterCmd[end] != ' ' && afterCmd[end] != '\t' {
+			end++
+		}
+		username := afterCmd[idx+1 : end]
+		identifier = "@" + username
+		// هر چیزی که @ نیست، اسمه
+		before := strings.TrimSpace(afterCmd[:idx])
+		after := strings.TrimSpace(afterCmd[end:])
+		if before != "" {
+			name = before
+		} else {
+			name = after
+		}
+		return
+	}
+
+	// اگه @ نبود، دنبال آیدی عددی بگرد
+	parts := strings.Fields(afterCmd)
 	var nameParts []string
 	for _, p := range parts {
-		hasAt := strings.Contains(p, "@")
-		_, numErr := strconv.ParseInt(strings.Trim(p, "@"), 10, 64)
-		if (hasAt || numErr == nil) && identifier == "" {
+		if id, err := strconv.ParseInt(p, 10, 64); err == nil && id > 0 && identifier == "" {
 			identifier = p
 		} else {
 			nameParts = append(nameParts, p)
@@ -274,8 +294,10 @@ func handleRegister(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	}
 
 	// ── روش ۲ و ۳: بدون reply
-	parts := strings.Fields(afterCmd)
-	if len(parts) < 2 {
+	// مستقیم توی کل متن دنبال @ یا آیدی عددی میگردیم — مشکل RTL/LTR نداره
+	name, identifier := parseFromText(afterCmd)
+
+	if name == "" && identifier == "" {
 		send(botAPI, chatID,
 			"❌ سه روش ثبت:\n\n"+
 				"۱. <b>reply</b> روی پیام + <code>ثبت فرهاد</code> ✅ بهترین\n"+
@@ -283,10 +305,6 @@ func handleRegister(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				"۳. <code>ثبت فرهاد @farhad</code> یوزرنیم", msgID)
 		return
 	}
-
-	// جدا کردن اسم و شناسه بدون توجه به ترتیب RTL/LTR
-	name, identifier := parseNameAndID(parts)
-
 	if name == "" || identifier == "" {
 		send(botAPI, chatID, "❌ اسم و شناسه رو هر دو بنویس.", msgID)
 		return
