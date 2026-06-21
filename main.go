@@ -305,8 +305,14 @@ func handleRegister(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				"۳. <code>ثبت فرهاد @farhad</code> یوزرنیم", msgID)
 		return
 	}
-	if name == "" || identifier == "" {
-		send(botAPI, chatID, "❌ اسم و شناسه رو هر دو بنویس.", msgID)
+	if identifier == "" {
+		// اسم پیدا شد ولی شناسه نه — یعنی طرف @username نداره
+		send(botAPI, chatID,
+			fmt.Sprintf("❌ «%s» @username نداره?\n\nروی یکی از پیام‌هاش <b>reply</b> کن و بنویس:\n<code>ثبت %s</code>", name, name), msgID)
+		return
+	}
+	if name == "" {
+		send(botAPI, chatID, "❌ اسم رو هم بنویس.", msgID)
 		return
 	}
 
@@ -319,8 +325,7 @@ func handleRegister(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			return
 		}
 		send(botAPI, chatID,
-			fmt.Sprintf("✅ <b>%s</b> (@%s) ثبت شد!\n⏳ آیدی عددی دفعه‌ای که پیام بده خودکار ذخیره میشه.",
-				name, username), msgID)
+			fmt.Sprintf("✅ <b>%s</b> (@%s) ثبت شد!", name, username), msgID)
 		return
 	}
 
