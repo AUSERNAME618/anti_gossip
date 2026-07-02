@@ -24,6 +24,26 @@ type Member struct {
 	LastSeen sql.NullTime
 }
 
+// ── Persian text normalization ──────────────────────────────────────────────
+// حروف عربی/فارسی که ظاهرشون یکیه ولی کد یونیکدشون فرق داره رو یکسان میکنه
+// مثلاً "ي" عربی vs "ی" فارسی، یا "ك" عربی vs "ک" فارسی
+var persianNormalizer = strings.NewReplacer(
+	"ي", "ی",
+	"ك", "ک",
+	"ة", "ه",
+	"ۀ", "ه",
+	"أ", "ا",
+	"إ", "ا",
+	"ؤ", "و",
+	"ئ", "ی",
+	"\u200c", "", // نیم‌فاصله (ZWNJ) — حذف میشه تا کلمات متصل یکسان مقایسه بشن
+	"\u00a0", " ", // space غیرشکن -> space معمولی
+)
+
+func normalizePersian(s string) string {
+	return persianNormalizer.Replace(s)
+}
+
 // ── Database ──────────────────────────────────────────────────────────────────
 
 func initDB() error {
@@ -32,7 +52,8 @@ func initDB() error {
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
-	db.SetMaxOpenConns(5)
+	// فقط یک کانکشن همزمان — از تصادم درخواست‌ها روی Neon جلوگیری میکنه
+	db.SetMaxOpenConns(1)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
 		return fmt.Errorf("ping: %w", err)
@@ -50,11 +71,7 @@ func initDB() error {
 	)`); err != nil {
 		return fmt.Errorf("create members: %w", err)
 	}
-
-	// migration: اگه جدول قدیمی‌تر بود، ستون last_seen رو اضافه کن
 	db.Exec(`ALTER TABLE members ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP`)
-
-	// حذف constraint قدیمی اگه وجود داشت
 	db.Exec(`ALTER TABLE members DROP CONSTRAINT IF EXISTS members_group_id_name_key`)
 
 	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS group_settings (
@@ -92,6 +109,7 @@ func getMembers(groupID int64) ([]Member, error) {
 }
 
 func insertMember(groupID, addedBy int64, name string, userID sql.NullInt64, username string) error {
+	name = normalizePersian(name)
 	if userID.Valid {
 		var count int
 		db.QueryRow(
@@ -114,28 +132,29 @@ func insertMember(groupID, addedBy int64, name string, userID sql.NullInt64, use
 	return err
 }
 
-// updateActivity: هر بار که کسی پیام میده این رو صدا میزنیم
-// هم last_seen آپدیت میشه هم username resolve میشه
+// updateActivity: last_seen رو آپدیت میکنه و username رو به آیدی عددی resolve میکنه
+// عمداً به صورت synchronous (بدون go) صدا زده میشه تا با query های دیگه تصادم نکنه
 func updateActivity(groupID int64, userID int64, username string) {
-	// آپدیت last_seen
-	db.Exec(`UPDATE members SET last_seen=NOW() WHERE group_id=$1 AND user_id=$2`,
-		groupID, userID)
+	if _, err := db.Exec(`UPDATE members SET last_seen=NOW() WHERE group_id=$1 AND user_id=$2`,
+		groupID, userID); err != nil {
+		log.Println("updateActivity last_seen error:", err)
+	}
 
-	// resolve username → user_id
 	if username != "" {
 		result, err := db.Exec(`
 			UPDATE members SET user_id=$1, last_seen=NOW()
 			WHERE group_id=$2 AND username=$3 AND user_id IS NULL
 		`, userID, groupID, username)
-		if err == nil {
-			if n, _ := result.RowsAffected(); n > 0 {
-				log.Printf("✅ auto-resolved @%s → %d", username, userID)
-			}
+		if err != nil {
+			log.Println("updateActivity resolve error:", err)
+		} else if n, _ := result.RowsAffected(); n > 0 {
+			log.Printf("✅ auto-resolved @%s → %d", username, userID)
 		}
 	}
 }
 
 func deleteMember(groupID int64, name string) (bool, error) {
+	name = normalizePersian(name)
 	res, err := db.Exec(`DELETE FROM members WHERE group_id=$1 AND name=$2`, groupID, name)
 	if err != nil {
 		return false, err
@@ -217,40 +236,79 @@ func send(botAPI *tgbotapi.BotAPI, chatID int64, text string, replyTo int) {
 	botAPI.Send(msg)
 }
 
-// isNamePresent: بررسی حضور اسم در متن با مرزبندی کلمه
-// از کاراکترهای نامرئی Unicode (RTL mark و غیره) هم محافظت میکنه
-func isNamePresent(text, name string) bool {
-	if !strings.Contains(text, name) {
-		return false
-	}
-	// اسم چند کلمه‌ای: همان contains کافیه
-	if strings.Contains(name, " ") {
-		return true
-	}
-	// اسم تک‌کلمه‌ای: چک مرز کلمه
-	words := strings.Fields(text)
-	for _, w := range words {
-		// حذف علائم نگارشی و کاراکترهای نامرئی Unicode (مثل RTL mark که تلگرام اضافه میکنه)
-		w = strings.TrimFunc(w, func(r rune) bool {
-			switch {
-			case r <= 0x20:
-				return true // control characters
-			case r >= 0x200B && r <= 0x200F:
-				return true // zero-width chars + RTL/LTR marks
-			case r >= 0x202A && r <= 0x202E:
-				return true // direction overrides
-			case r == 0xFEFF:
-				return true // BOM
-			}
-			return strings.ContainsRune("!?.،؟؛:\"'()-_…«»،؛", r)
-		})
-		if w == name {
+// cleanWord: کاراکترهای نامرئی و علائم نگارشی رو از یه کلمه حذف میکنه
+func cleanWord(w string) string {
+	return strings.TrimFunc(w, func(r rune) bool {
+		switch {
+		case r <= 0x20:
+			return true
+		case r >= 0x200B && r <= 0x200F:
+			return true
+		case r >= 0x202A && r <= 0x202E:
+			return true
+		case r == 0xFEFF:
 			return true
 		}
-		for _, s := range []string{"ی", "و", "رو", "را", "ام", "ات", "اش", "هم"} {
-			if w == name+s {
-				return true
+		return strings.ContainsRune("!?.,،؟؛:\"'()-_…«»", r)
+	})
+}
+
+// tokenizeWords: متن رو به کلمات تمیزشده تبدیل میکنه
+func tokenizeWords(text string) []string {
+	raw := strings.Fields(text)
+	out := make([]string, 0, len(raw))
+	for _, w := range raw {
+		w = cleanWord(w)
+		if w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// hasSuffixMatch: چک میکنه کلمه با پسوند رایج فارسی به اسم چسبیده باشه (مثل علیو، رضارو)
+func hasSuffixMatch(word, base string) bool {
+	if word == base {
+		return true
+	}
+	for _, s := range []string{"ی", "و", "رو", "را", "ام", "ات", "اش", "هم"} {
+		if word == base+s {
+			return true
+		}
+	}
+	return false
+}
+
+// isNamePresent: اسم (یک یا چند کلمه‌ای) رو با رعایت مرز کلمه در متن پیدا میکنه
+// "محمد رضا" فقط وقتی matches میشه که دقیقاً همون دو کلمه پشت‌سرهم بیان — نه فقط "محمد"
+func isNamePresent(text, name string) bool {
+	text = normalizePersian(text)
+	name = normalizePersian(name)
+
+	nameWords := tokenizeWords(name)
+	if len(nameWords) == 0 {
+		return false
+	}
+	textWords := tokenizeWords(text)
+
+	for i := 0; i+len(nameWords) <= len(textWords); i++ {
+		matched := true
+		for j := 0; j < len(nameWords); j++ {
+			tw := textWords[i+j]
+			nw := nameWords[j]
+			if j == len(nameWords)-1 {
+				// فقط آخرین کلمه اجازه پسوند داره
+				if !hasSuffixMatch(tw, nw) {
+					matched = false
+					break
+				}
+			} else if tw != nw {
+				matched = false
+				break
 			}
+		}
+		if matched {
+			return true
 		}
 	}
 	return false
@@ -381,8 +439,8 @@ func handleAlias(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		send(botAPI, chatID, "❌ فرمت: <code>لقب فری فرهاد</code>", msgID)
 		return
 	}
-	aliasName := parts[0]
-	mainName := parts[1]
+	aliasName := normalizePersian(parts[0])
+	mainName := normalizePersian(parts[1])
 
 	var mainUserID sql.NullInt64
 	var mainUsername string
@@ -523,7 +581,11 @@ func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 	members, err := getMembers(chatID)
-	if err != nil || len(members) == 0 {
+	if err != nil {
+		log.Println("getMembers error in handleMessage:", err)
+		return
+	}
+	if len(members) == 0 {
 		return
 	}
 
@@ -541,7 +603,7 @@ func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		if !isNamePresent(text, m.Name) {
 			continue
 		}
-		// اگه ۵ دقیقه اخیر پیام داده، تگش نکن
+		// اگه ۵ دقیقه اخیر توی گروه پیام داده، تگ نکن
 		if m.LastSeen.Valid && time.Since(m.LastSeen.Time) < 5*time.Minute {
 			continue
 		}
@@ -585,7 +647,6 @@ func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				normalMentions = append(normalMentions, mentionByUsername(name, m.Username))
 			}
 		} else {
-			// چند نفر با یه اسم
 			var tags []string
 			for _, m := range unique {
 				if m.UserID.Valid && !taggedIDs[m.UserID.Int64] {
@@ -666,8 +727,8 @@ func main() {
 			continue
 		}
 
-		// آپدیت last_seen و resolve username برای هر پیام
-		go updateActivity(msg.Chat.ID, int64(msg.From.ID), msg.From.UserName)
+		// synchronous — بدون "go" — تا با query های دیگه همزمان تصادم نکنه
+		updateActivity(msg.Chat.ID, int64(msg.From.ID), msg.From.UserName)
 
 		text := strings.TrimSpace(msg.Text)
 
