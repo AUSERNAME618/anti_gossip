@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strconv"
@@ -16,6 +20,7 @@ import (
 )
 
 var db *sql.DB
+var groqToken string
 
 type Member struct {
 	Name     string
@@ -574,12 +579,94 @@ func handleToggleAdmin(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message, enable bo
 	}
 }
 
-func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	chatID := msg.Chat.ID
-	text := msg.Text
+// transcribeAudio: فایل صوتی رو دانلود و به متن فارسی تبدیل میکنه (از Groq Whisper Large v3)
+func transcribeAudio(fileURL string) (string, error) {
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return "", fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	audioBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read audio: %w", err)
+	}
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	part, err := writer.CreateFormFile("file", "voice.ogg")
+	if err != nil {
+		return "", err
+	}
+	if _, err := part.Write(audioBytes); err != nil {
+		return "", err
+	}
+	writer.WriteField("model", "whisper-large-v3")
+	writer.WriteField("language", "fa") // راهنمایی به مدل که صدا فارسیه — دقت رو بالاتر میبره
+	writer.WriteField("response_format", "json")
+	writer.Close()
+
+	req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/audio/transcriptions", &buf)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+groqToken)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("groq request: %w", err)
+	}
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("groq error %d: %s", res.StatusCode, string(body))
+	}
+
+	var result struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+	return result.Text, nil
+}
+
+// handleVoice: پیام صوتی رو به متن تبدیل و همون منطق تشخیص اسم رو روش اجرا میکنه
+// عمداً synchronous (بدون go) — تا با DB تصادم نکنه
+func handleVoice(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	if msg.Voice == nil || groqToken == "" {
+		return
+	}
+
+	file, err := botAPI.GetFile(tgbotapi.FileConfig{FileID: msg.Voice.FileID})
+	if err != nil {
+		log.Println("GetFile error:", err)
+		return
+	}
+	fileURL := file.Link(botAPI.Token)
+
+	text, err := transcribeAudio(fileURL)
+	if err != nil {
+		log.Println("transcribeAudio error:", err)
+		return
+	}
 	if text == "" {
 		return
 	}
+
+	checkAndTagNames(botAPI, msg, text)
+}
+
+// checkAndTagNames: اسم‌های ثبت‌شده رو توی متن (از پیام یا از ویس تبدیل‌شده) پیدا و تگ میکنه
+func checkAndTagNames(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message, text string) {
+	chatID := msg.Chat.ID
+	if text == "" {
+		return
+	}
+
 	members, err := getMembers(chatID)
 	if err != nil {
 		log.Println("getMembers error in handleMessage:", err)
@@ -678,6 +765,11 @@ func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	send(botAPI, chatID, body, msg.MessageID)
 }
 
+// handleMessage: پیام متنی معمولی — همون منطق checkAndTagNames رو با msg.Text صدا میزنه
+func handleMessage(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	checkAndTagNames(botAPI, msg, msg.Text)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -694,6 +786,13 @@ func main() {
 		log.Panic(err)
 	}
 	log.Printf("✅ Bot running as @%s", botAPI.Self.UserName)
+
+	groqToken = os.Getenv("GROQ_API_TOKEN")
+	if groqToken == "" {
+		log.Println("⚠️ GROQ_API_TOKEN not set — voice message detection disabled")
+	} else {
+		log.Println("✅ Voice transcription enabled (Groq Whisper)")
+	}
 
 	go func() {
 		port := os.Getenv("PORT")
@@ -729,6 +828,12 @@ func main() {
 
 		// synchronous — بدون "go" — تا با query های دیگه همزمان تصادم نکنه
 		updateActivity(msg.Chat.ID, int64(msg.From.ID), msg.From.UserName)
+
+		// پیام صوتی (ویس) — تبدیل به متن و بررسی اسم‌ها
+		if msg.Voice != nil {
+			handleVoice(botAPI, msg)
+			continue
+		}
 
 		text := strings.TrimSpace(msg.Text)
 
