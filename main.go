@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -579,14 +580,113 @@ func handleToggleAdmin(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message, enable bo
 	}
 }
 
-// transcribeAudio: فایل صوتی رو دانلود و به متن فارسی تبدیل میکنه (از Groq Whisper Large v3)
-func transcribeAudio(fileURL string) (string, error) {
+const chunkMaxSec = 25   // هر تکه حداکثر ۲۵ ثانیه — کاملاً زیر بازه بهینه ۳۰ ثانیه‌ای Whisper
+const chunkOverlapSec = 5 // همپوشانی بین تکه‌های پشت‌سرهم — تضمین میکنه کلمه‌ای روی خط برش گم نشه
+const chunkStepSec = chunkMaxSec - chunkOverlapSec
+
+// buildPromptFromNames: لیست اسم‌های ثبت‌شده گروه رو به یه prompt برای Whisper تبدیل میکنه
+// این کار دقت تشخیص این اسم‌های خاص رو به شدت بالا میبره — حتی وقتی فقط یه بار گفته بشن
+func buildPromptFromNames(groupID int64) string {
+	members, err := getMembers(groupID)
+	if err != nil || len(members) == 0 {
+		return ""
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, m := range members {
+		if !seen[m.Name] {
+			seen[m.Name] = true
+			names = append(names, m.Name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return "اسم‌های افراد این مکالمه: " + strings.Join(names, "، ")
+}
+
+// padAudioEnd: به انتهای فایل صوتی کمی سکوت اضافه میکنه
+// چون Whisper وقتی صدا بدون مکث قطع بشه، معمولاً آخرین کلمه رو گم میکنه یا اشتباه میفهمه
+func padAudioEnd(inputPath string) (string, error) {
+	outPath := inputPath + ".padded.ogg"
+	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, "-af", "apad=pad_dur=1.5", outPath)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffmpeg pad: %w", err)
+	}
+	return outPath, nil
+}
+
+// downloadToTemp: فایل صوتی رو از تلگرام دانلود و توی یه فایل موقت ذخیره میکنه
+func downloadToTemp(fileURL string) (string, error) {
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		return "", fmt.Errorf("download: %w", err)
 	}
 	defer resp.Body.Close()
-	audioBytes, err := io.ReadAll(resp.Body)
+
+	tmpFile, err := os.CreateTemp("", "voice-*.ogg")
+	if err != nil {
+		return "", fmt.Errorf("temp file: %w", err)
+	}
+	defer tmpFile.Close()
+
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		return "", fmt.Errorf("write temp: %w", err)
+	}
+	return tmpFile.Name(), nil
+}
+
+// getAudioDuration: با ffprobe مدت زمان فایل صوتی رو به ثانیه برمیگردونه
+func getAudioDuration(path string) (float64, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe: %w", err)
+	}
+	dur, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse duration: %w", err)
+	}
+	return dur, nil
+}
+
+// splitAudioChunks: فایل صوتی طولانی رو با همپوشانی به تکه‌های کوچیک‌تر تقسیم میکنه
+// اگه فایل کوتاه‌تر از حد مجاز باشه، همون فایل اصلی رو برمیگردونه (بدون هزینه اضافه)
+func splitAudioChunks(inputPath string, duration float64) ([]string, error) {
+	if duration <= chunkMaxSec {
+		return []string{inputPath}, nil
+	}
+
+	var chunks []string
+	start := 0.0
+	i := 0
+	for start < duration {
+		chunkDur := chunkMaxSec
+		if start+float64(chunkMaxSec) > duration {
+			chunkDur = int(duration - start)
+		}
+		if chunkDur <= 0 {
+			break
+		}
+		outPath := fmt.Sprintf("%s.chunk%d.ogg", inputPath, i)
+		cmd := exec.Command("ffmpeg", "-y", "-i", inputPath,
+			"-ss", fmt.Sprintf("%.2f", start),
+			"-t", fmt.Sprintf("%d", chunkDur),
+			"-c", "copy", outPath)
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("ffmpeg chunk %d: %w", i, err)
+		}
+		chunks = append(chunks, outPath)
+		start += chunkStepSec
+		i++
+	}
+	return chunks, nil
+}
+
+// transcribeFile: یه فایل صوتی (یا تکه‌ای از اون) رو با Groq Whisper به متن تبدیل میکنه
+// prompt: لیست اسم‌های محتمل که به مدل کمک میکنه دقیق‌تر تشخیص بده
+func transcribeFile(path string, prompt string) (string, error) {
+	audioBytes, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read audio: %w", err)
 	}
@@ -604,6 +704,10 @@ func transcribeAudio(fileURL string) (string, error) {
 	writer.WriteField("model", "whisper-large-v3")
 	writer.WriteField("language", "fa") // راهنمایی به مدل که صدا فارسیه — دقت رو بالاتر میبره
 	writer.WriteField("response_format", "json")
+	writer.WriteField("temperature", "0") // خروجی قطعی‌تر و کمتر تصادفی
+	if prompt != "" {
+		writer.WriteField("prompt", prompt)
+	}
 	writer.Close()
 
 	req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/audio/transcriptions", &buf)
@@ -634,6 +738,36 @@ func transcribeAudio(fileURL string) (string, error) {
 	return result.Text, nil
 }
 
+// transcribeWithChunking: در صورت طولانی بودن صدا، تکه‌تکه (با همپوشانی) تبدیل میکنه
+// و در نهایت متن کامل رو برمیگردونه
+func transcribeWithChunking(path string, prompt string) (string, error) {
+	duration, err := getAudioDuration(path)
+	if err != nil {
+		log.Println("getAudioDuration failed, trying whole file:", err)
+		return transcribeFile(path, prompt)
+	}
+
+	chunks, err := splitAudioChunks(path, duration)
+	if err != nil {
+		log.Println("splitAudioChunks failed, trying whole file:", err)
+		return transcribeFile(path, prompt)
+	}
+
+	var texts []string
+	for _, chunkPath := range chunks {
+		if chunkPath != path {
+			defer os.Remove(chunkPath)
+		}
+		t, err := transcribeFile(chunkPath, prompt)
+		if err != nil {
+			log.Println("transcribe chunk error:", err)
+			continue
+		}
+		texts = append(texts, t)
+	}
+	return strings.Join(texts, " "), nil
+}
+
 // handleVoice: پیام صوتی رو به متن تبدیل و همون منطق تشخیص اسم رو روش اجرا میکنه
 // عمداً synchronous (بدون go) — تا با DB تصادم نکنه
 func handleVoice(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
@@ -648,9 +782,25 @@ func handleVoice(botAPI *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	}
 	fileURL := file.Link(botAPI.Token)
 
-	text, err := transcribeAudio(fileURL)
+	localPath, err := downloadToTemp(fileURL)
 	if err != nil {
-		log.Println("transcribeAudio error:", err)
+		log.Println("downloadToTemp error:", err)
+		return
+	}
+	defer os.Remove(localPath)
+
+	// یه‌ذره سکوت به انتها اضافه میکنیم — تا آخرین کلمه (دقیقاً جایی که صدا قطع میشه) گم نشه
+	processPath := localPath
+	if padded, perr := padAudioEnd(localPath); perr == nil {
+		processPath = padded
+		defer os.Remove(padded)
+	} else {
+		log.Println("padAudioEnd failed, using unpadded file:", perr)
+	}
+
+	text, err := transcribeWithChunking(processPath, buildPromptFromNames(msg.Chat.ID))
+	if err != nil {
+		log.Println("transcribeWithChunking error:", err)
 		return
 	}
 	if text == "" {
