@@ -32,7 +32,3 @@ type Member struct {
 
 // ── Persian text normalization ──────────────────────────────────────────────
 // حروف عربی/فارسی که ظاهرشون یکیه ولی کد یونیکدشون فرق داره رو یکسان میکنه
-// مثلاً "ي" عربی vs "ی" فارسی، یا "ك" عربی vs "ک" فارسی
-var persianNormalizer = strings.NewReplacer(
-	"ي", "ی",
-	"ك", "ک",
